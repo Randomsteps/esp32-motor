@@ -1,26 +1,32 @@
 #include <stdio.h>
 #include <string.h>
-#include <stdint.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 #include "freertos/semphr.h"
-
-#include "driver/uart.h"
-#include "driver/gpio.h"
 
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
 #include "esp_http_server.h"
 #include "nvs_flash.h"
+
+#include "driver/uart.h"
+
 #include "led_strip.h"
 
 // =====================================================
 // 用户配置
 // =====================================================
+
+#define WIFI_SSID           "Redmi K70"
+#define WIFI_PASS           "aaaaaaaa"
 
 #define DXL_UART_NUM        UART_NUM_1
 #define DXL_TX_GPIO         4
@@ -29,25 +35,40 @@
 #define DXL_ID              1
 #define DXL_RX_BUF_SIZE     1024
 
-#define WIFI_SSID           "XL330-Wizard"
-#define WIFI_PASS           "12345678"
-#define WS2812_GPIO         38   // ESP32-S3-DevKitC v1.1
+#define WS2812_GPIO         38
 
 static const char *TAG = "XL330";
-static led_strip_handle_t ws2812;
+
+static EventGroupHandle_t wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
+
+static led_strip_handle_t ws2812 = NULL;
+static char g_ip_str[32] = "0.0.0.0";
 static SemaphoreHandle_t uart_mutex;
 
 // =====================================================
-// DYNAMIXEL Protocol 2.0
+// WS2812
+// =====================================================
+
+static void ws2812_init(void) {
+    led_strip_config_t sc = {.strip_gpio_num=WS2812_GPIO,.max_leds=1};
+    led_strip_rmt_config_t rc = {.resolution_hz=10*1000*1000};
+    esp_err_t ret = led_strip_new_rmt_device(&sc,&rc,&ws2812);
+    if(ret==ESP_OK){led_strip_clear(ws2812);ESP_LOGI(TAG,"WS2812 OK");}
+    else{ESP_LOGW(TAG,"WS2812 fail");ws2812=NULL;}
+}
+static void ws2812_rgb(uint8_t r,uint8_t g,uint8_t b) {
+    if(!ws2812)return;
+    led_strip_set_pixel(ws2812,0,r,g,b);led_strip_refresh(ws2812);
+}
+// Dynamixel Protocol 2.0
 // =====================================================
 
 #define DXL_INST_PING       0x01
 #define DXL_INST_READ       0x02
 #define DXL_INST_WRITE      0x03
-#define DXL_STATUS_PACKET   0x55
+#define DXL_STATUS           0x55
 
-#define ADDR_MODEL_NUMBER        0
-#define ADDR_FIRMWARE_VERSION    6
 #define ADDR_OPERATING_MODE      11
 #define ADDR_TORQUE_ENABLE       64
 #define ADDR_LED                 65
@@ -55,18 +76,10 @@ static SemaphoreHandle_t uart_mutex;
 #define ADDR_PRESENT_POSITION    132
 #define ADDR_PRESENT_VELOCITY    128
 #define ADDR_PRESENT_CURRENT     126
-#define ADDR_HW_ERROR_STATUS     70
 
-#define MODE_CURRENT             0
-#define MODE_VELOCITY            1
 #define MODE_POSITION            3
-#define MODE_EXT_POSITION        4
 
-// =====================================================
-// CRC 表
-// =====================================================
-
-static const uint16_t crc_table[256] = {
+static const uint16_t crc16[256]={
     0x0000,0x8005,0x800F,0x000A,0x801B,0x001E,0x0014,0x8011,
     0x8033,0x0036,0x003C,0x8039,0x0028,0x802D,0x8027,0x0022,
     0x8063,0x0066,0x006C,0x8069,0x0078,0x807D,0x8077,0x0072,
@@ -98,15 +111,11 @@ static const uint16_t crc_table[256] = {
     0x8243,0x0246,0x024C,0x8249,0x0258,0x825D,0x8257,0x0252,
     0x0270,0x8275,0x827F,0x027A,0x826B,0x026E,0x0264,0x8261,
     0x0220,0x8225,0x822F,0x022A,0x823B,0x023E,0x0234,0x8231,
-    0x8213,0x0216,0x021C,0x8219,0x0208,0x820D,0x8207,0x0202
-};
+    0x8213,0x0216,0x021C,0x8219,0x0208,0x820D,0x8207,0x0202};
 
-static uint16_t dxl_update_crc(uint16_t crc_accum, const uint8_t *data_blk_ptr, uint16_t data_blk_size) {
-    for (uint16_t j = 0; j < data_blk_size; j++) {
-        uint16_t i = ((uint16_t)(crc_accum >> 8) ^ data_blk_ptr[j]) & 0xFF;
-        crc_accum = (crc_accum << 8) ^ crc_table[i];
-    }
-    return crc_accum;
+static uint16_t crc_up(uint16_t c,const uint8_t*d,uint16_t n){
+    for(uint16_t j=0;j<n;j++){uint16_t i=((c>>8)^d[j])&0xFF;c=(c<<8)^crc16[i];}
+    return c;
 }
 
 // =====================================================
@@ -114,8 +123,8 @@ static uint16_t dxl_update_crc(uint16_t crc_accum, const uint8_t *data_blk_ptr, 
 // =====================================================
 
 static void dxl_uart_init(void) {
-    uart_config_t c = {.baud_rate=DXL_BAUDRATE,.data_bits=UART_DATA_8_BITS,.parity=UART_PARITY_DISABLE,
-                       .stop_bits=UART_STOP_BITS_1,.flow_ctrl=UART_HW_FLOWCTRL_DISABLE,.source_clk=UART_SCLK_DEFAULT};
+    uart_config_t c={.baud_rate=DXL_BAUDRATE,.data_bits=UART_DATA_8_BITS,.parity=UART_PARITY_DISABLE,
+                     .stop_bits=UART_STOP_BITS_1,.flow_ctrl=UART_HW_FLOWCTRL_DISABLE,.source_clk=UART_SCLK_DEFAULT};
     ESP_ERROR_CHECK(uart_driver_install(DXL_UART_NUM,DXL_RX_BUF_SIZE,0,0,NULL,0));
     ESP_ERROR_CHECK(uart_param_config(DXL_UART_NUM,&c));
     ESP_ERROR_CHECK(uart_set_pin(DXL_UART_NUM,DXL_TX_GPIO,DXL_RX_GPIO,UART_PIN_NO_CHANGE,UART_PIN_NO_CHANGE));
@@ -123,85 +132,74 @@ static void dxl_uart_init(void) {
     uart_flush_input(DXL_UART_NUM);
 }
 
-static esp_err_t dxl_send(uint8_t id, uint8_t inst, const uint8_t *params, uint16_t plen) {
-    uint8_t p[256]; uint16_t idx=0, len=plen+3;
-    p[idx++]=0xFF;p[idx++]=0xFF;p[idx++]=0xFD;p[idx++]=0x00;p[idx++]=id;
+static esp_err_t dxl_send(uint8_t id,uint8_t inst,const uint8_t*params,uint16_t plen){
+    uint8_t p[256];uint16_t idx=0,len=plen+3;
+    p[idx++]=0xFF;p[idx++]=0xFF;p[idx++]=0xFD;p[idx++]=0;p[idx++]=id;
     p[idx++]=len&0xFF;p[idx++]=len>>8;p[idx++]=inst;
     for(int i=0;i<plen;i++)p[idx++]=params[i];
-    uint16_t crc=0;for(int i=0;i<idx;i++)crc=dxl_update_crc(crc,&p[i],1);
+    uint16_t crc=0;for(int i=0;i<idx;i++)crc=crc_up(crc,&p[i],1);
     p[idx++]=crc&0xFF;p[idx++]=crc>>8;
     int w=uart_write_bytes(DXL_UART_NUM,(const char*)p,idx);
     uart_wait_tx_done(DXL_UART_NUM,pdMS_TO_TICKS(30));
     return w==idx?ESP_OK:ESP_FAIL;
 }
 
-static esp_err_t dxl_recv(uint8_t *id, uint8_t *err, uint8_t *params, uint16_t *plen, int to) {
-    uint8_t rx[512]; int total=0;
-    TickType_t s=xTaskGetTickCount(), d=pdMS_TO_TICKS(to);
+static esp_err_t dxl_recv(uint8_t*id,uint8_t*err,uint8_t*params,uint16_t*plen,int to){
+    uint8_t rx[512];int t=0;TickType_t s=xTaskGetTickCount(),d=pdMS_TO_TICKS(to);
     while((xTaskGetTickCount()-s)<d){
-        int n=uart_read_bytes(DXL_UART_NUM,rx+total,sizeof(rx)-total,pdMS_TO_TICKS(10));
-        if(n>0){total+=n;
-            for(int i=0;i<=total-10;i++){
-                if(rx[i]!=0xFF||rx[i+1]!=0xFF||rx[i+2]!=0xFD||rx[i+3]!=0x00)continue;
+        int n=uart_read_bytes(DXL_UART_NUM,rx+t,sizeof(rx)-t,pdMS_TO_TICKS(10));
+        if(n>0){t+=n;
+            for(int i=0;i<=t-10;i++){
+                if(rx[i]!=0xFF||rx[i+1]!=0xFF||rx[i+2]!=0xFD||rx[i+3]!=0)continue;
                 uint8_t rid=rx[i+4];uint16_t len=rx[i+5]|(rx[i+6]<<8);int pl=7+len;
-                if(pl<10||i+pl>total)continue;
-                if(rx[i+7]!=DXL_STATUS_PACKET||rid!=*id)continue;
+                if(pl<10||i+pl>t)continue;
+                if(rx[i+7]!=DXL_STATUS||rid!=*id)continue;
                 uint16_t rc=rx[i+pl-2]|(rx[i+pl-1]<<8),cc=0;
-                for(int k=0;k<pl-2;k++)cc=dxl_update_crc(cc,&rx[i+k],1);
+                for(int k=0;k<pl-2;k++)cc=crc_up(cc,&rx[i+k],1);
                 if(rc!=cc)return ESP_FAIL;
-                *err=rx[i+8];uint16_t rl=len-4;
-                if(plen)*plen=rl;
-                if(params&&rl)memcpy(params,rx+i+9,rl);
-                *id=rid;return ESP_OK;
+                *err=rx[i+8];
+                uint16_t rl=len-4;
+                if(plen) *plen=rl;
+                if(params&&rl) memcpy(params,rx+i+9,rl);
+                *id=rid;
+                return ESP_OK;
             }
-            if(total>450)total=0;
+            if(t>450)t=0;
         }
     }
     return ESP_ERR_TIMEOUT;
 }
 
 // =====================================================
-// 高层 API (给 HTTP 用, 已加 UART 锁)
+// 高层 API (带锁)
 // =====================================================
 
-static bool dl_ping(uint8_t id) {
+static bool dl_ping(uint8_t id){
     if(xSemaphoreTake(uart_mutex,pdMS_TO_TICKS(800))!=pdTRUE)return false;
     dxl_send(id,DXL_INST_PING,NULL,0);
     uint8_t rid=id,err=0;uint16_t pl=0;uint8_t p[16];
     bool ok=dxl_recv(&rid,&err,p,&pl,80)==ESP_OK&&err==0;
-    xSemaphoreGive(uart_mutex);
-    return ok;
+    xSemaphoreGive(uart_mutex);return ok;
 }
 
-static esp_err_t dl_write1(uint8_t id,uint16_t addr,uint8_t v) {
+static esp_err_t dl_write1(uint8_t id,uint16_t addr,uint8_t v){
     if(xSemaphoreTake(uart_mutex,pdMS_TO_TICKS(800))!=pdTRUE)return ESP_ERR_TIMEOUT;
     uint8_t p[]={addr&0xFF,addr>>8,v};
     esp_err_t r=dxl_send(id,DXL_INST_WRITE,p,3);
     if(r==ESP_OK){uint8_t rid=id,err=0;uint16_t pl=0;r=dxl_recv(&rid,&err,NULL,&pl,150);}
-    xSemaphoreGive(uart_mutex);
-    return r;
+    xSemaphoreGive(uart_mutex);return r;
 }
 
-static esp_err_t dl_write4(uint8_t id,uint16_t addr,uint32_t v) {
+static esp_err_t dl_write4(uint8_t id,uint16_t addr,uint32_t v){
     if(xSemaphoreTake(uart_mutex,pdMS_TO_TICKS(800))!=pdTRUE)return ESP_ERR_TIMEOUT;
     uint8_t p[]={addr&0xFF,addr>>8,v&0xFF,(v>>8)&0xFF,(v>>16)&0xFF,(v>>24)&0xFF};
     esp_err_t r=dxl_send(id,DXL_INST_WRITE,p,6);
     if(r==ESP_OK){uint8_t rid=id,err=0;uint16_t pl=0;r=dxl_recv(&rid,&err,NULL,&pl,150);}
-    xSemaphoreGive(uart_mutex);
-    return r;
+    xSemaphoreGive(uart_mutex);return r;
 }
 
-// =====================================================
-// 后台高速轮询 (50ms 间隔, 一次批量读)
-// =====================================================
-
-static volatile int32_t g_pos = 0;   // Present Position
-static volatile int32_t g_vel = 0;   // Present Velocity
-static volatile int16_t g_cur = 0;   // Present Current
-static volatile int32_t g_goal = 0;  // 上一次发送的目标角度 (deg)
-
-// 一次批量读 10 字节: Current(2) + Velocity(4) + Position(4) = addr 126
-static void dl_read_bulk(uint8_t id, int32_t *pos, int32_t *vel, int16_t *cur) {
+// 批量读: Current(2)+Vel(4)+Pos(4) = 10 bytes from addr 126
+static void dl_read_bulk(uint8_t id,int32_t*pos,int32_t*vel,int16_t*cur){
     if(xSemaphoreTake(uart_mutex,pdMS_TO_TICKS(200))!=pdTRUE)return;
     uint8_t p[]={126&0xFF,126>>8,10,0};
     if(dxl_send(id,DXL_INST_READ,p,4)==ESP_OK){
@@ -215,277 +213,231 @@ static void dl_read_bulk(uint8_t id, int32_t *pos, int32_t *vel, int16_t *cur) {
     xSemaphoreGive(uart_mutex);
 }
 
-static void poll_task(void *arg) {
-    while(1) {
-        int32_t p=0,v=0;int16_t c=0;
-        dl_read_bulk(DXL_ID,&p,&v,&c);
-        g_pos=p;g_vel=v;g_cur=c;
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
+// =====================================================
+// 后台任务
+// =====================================================
+
+static volatile int32_t g_pos=0,g_vel=0,g_goal=0;
+static volatile int16_t g_cur=0;
+
+static void poll_task(void*arg){
+    while(1){int32_t p=0,v=0;int16_t c=0;dl_read_bulk(DXL_ID,&p,&v,&c);g_pos=p;g_vel=v;g_cur=c;vTaskDelay(pdMS_TO_TICKS(50));}
 }
 
-// 独立恢复任务: 每 3 秒检查一次, 只占锁一瞬间
-static void recover_task(void *arg) {
-    while(1) {
+static void recover_task(void*arg){
+    while(1){
         vTaskDelay(pdMS_TO_TICKS(3000));
         if(xSemaphoreTake(uart_mutex,pdMS_TO_TICKS(500))!=pdTRUE)continue;
-        // 读扭矩
-        uint8_t tq=0, p1[]={ADDR_TORQUE_ENABLE&0xFF,0,1,0};
+        uint8_t tq=0;bool ok=false;
+        uint8_t p1[]={ADDR_TORQUE_ENABLE&0xFF,0,1,0};
         if(dxl_send(DXL_ID,DXL_INST_READ,p1,4)==ESP_OK){
             uint8_t rid=DXL_ID,er=0,d=0;uint16_t pl=0;
-            if(dxl_recv(&rid,&er,&d,&pl,80)==ESP_OK)tq=d;
+            if(dxl_recv(&rid,&er,&d,&pl,80)==ESP_OK){tq=d;ok=true;}
         }
         xSemaphoreGive(uart_mutex);
-        // 如果扭矩掉了, 在锁外面恢复 (dl_write1 自己会拿锁)
-        if(tq==0){
-            ESP_LOGW(TAG,"扭矩被关断, 自动恢复");
-            dl_write1(DXL_ID,ADDR_TORQUE_ENABLE,0);
-            dl_write1(DXL_ID,ADDR_TORQUE_ENABLE,1);
-        }
+        if(ok&&tq==0){ESP_LOGW(TAG,"扭矩关断,自动恢复");dl_write1(DXL_ID,ADDR_TORQUE_ENABLE,0);dl_write1(DXL_ID,ADDR_TORQUE_ENABLE,1);}
     }
 }
 
 // =====================================================
-// WS2812
+// HTTP 页面
 // =====================================================
 
-static void ws2812_init(void) {
-    led_strip_config_t sc={.strip_gpio_num=WS2812_GPIO,.max_leds=1};
-    led_strip_rmt_config_t rc={.resolution_hz=10*1000*1000};
-    ESP_ERROR_CHECK(led_strip_new_rmt_device(&sc,&rc,&ws2812));
-    led_strip_clear(ws2812);
-}
-static void ws2812_set(bool on) {
-    if(on){led_strip_set_pixel(ws2812,0,30,0,30);}
-    else{led_strip_clear(ws2812);}
-    led_strip_refresh(ws2812);
-}
-
-// =====================================================
-// HTTP Server
-// =====================================================
-
-static uint8_t get_id(httpd_req_t *r) {
-    char b[32],v[8]; httpd_req_get_url_query_str(r,b,sizeof(b));
-    if(httpd_query_key_value(b,"id",v,sizeof(v))==ESP_OK)return atoi(v);
-    return DXL_ID;
-}
-
-static esp_err_t h_ping(httpd_req_t *r) {
-    uint8_t id=get_id(r); bool ok=dl_ping(id);
-    char m[32]; snprintf(m,sizeof(m),ok?"ID%d OK":"ID%d 无响应",id);
-    httpd_resp_set_type(r,"text/plain"); httpd_resp_send(r,m,strlen(m));
-    return ESP_OK;
-}
-
-static esp_err_t h_scan(httpd_req_t *r) {
-    char m[256]="";
-    for(int id=0;id<=6;id++) {
-        if(dl_ping(id)){char t[32];snprintf(t,sizeof(t),"ID%d ",id);strcat(m,t);}
-    }
-    if(strlen(m)==0)strcpy(m,"未找到舵机");
-    httpd_resp_set_type(r,"text/plain"); httpd_resp_send(r,m,strlen(m));
-    return ESP_OK;
-}
-
-// 写操作封装: 失败重试一次
-static esp_err_t dl_write1_retry(uint8_t id,uint16_t addr,uint8_t v){
-    if(dl_write1(id,addr,v)==ESP_OK)return ESP_OK;
-    vTaskDelay(pdMS_TO_TICKS(30));
-    return dl_write1(id,addr,v);
-}
-static esp_err_t dl_write4_retry(uint8_t id,uint16_t addr,uint32_t v){
-    if(dl_write4(id,addr,v)==ESP_OK)return ESP_OK;
-    vTaskDelay(pdMS_TO_TICKS(30));
-    return dl_write4(id,addr,v);
-}
-
-static esp_err_t h_torque(httpd_req_t *r) {
-    char b[32],v[8];httpd_req_get_url_query_str(r,b,sizeof(b));
-    int on=0;if(httpd_query_key_value(b,"on",v,sizeof(v))==ESP_OK)on=atoi(v);
-    esp_err_t ret=dl_write1_retry(get_id(r),ADDR_TORQUE_ENABLE,on?1:0);
-    httpd_resp_set_type(r,"text/plain"); httpd_resp_send(r,ret==ESP_OK?(on?"ON":"OFF"):"FAIL",ret==ESP_OK?2:4);
-    return ESP_OK;
-}
-
-static esp_err_t h_mode(httpd_req_t *r) {
-    char b[32],v[8];httpd_req_get_url_query_str(r,b,sizeof(b));
-    int m=3;if(httpd_query_key_value(b,"v",v,sizeof(v))==ESP_OK)m=atoi(v);
-    uint8_t id=get_id(r);
-    dl_write1_retry(id,ADDR_TORQUE_ENABLE,0);
-    dl_write1_retry(id,ADDR_OPERATING_MODE,m);
-    dl_write1_retry(id,ADDR_TORQUE_ENABLE,1);
-    httpd_resp_set_type(r,"text/plain"); httpd_resp_send(r,"OK",2);
-    return ESP_OK;
-}
-
-static esp_err_t h_pos(httpd_req_t *r) {
-    char b[32],v[8];httpd_req_get_url_query_str(r,b,sizeof(b));
-    int deg=0;if(httpd_query_key_value(b,"deg",v,sizeof(v))==ESP_OK)deg=atoi(v);
-    if(deg<0||deg>360){httpd_resp_send_err(r,HTTPD_400_BAD_REQUEST,"0-360");return ESP_FAIL;}
-    g_goal=deg;
-    esp_err_t ret=dl_write4_retry(get_id(r),ADDR_GOAL_POSITION,(uint32_t)(deg/360.0*4096));
-    char m[32];snprintf(m,sizeof(m),ret==ESP_OK?"%d°":"%d° 重试失败",deg);
-    httpd_resp_set_type(r,"text/plain"); httpd_resp_send(r,m,strlen(m));
-    return ESP_OK;
-}
-
-static esp_err_t h_led(httpd_req_t *r) {
-    char b[32],v[8];httpd_req_get_url_query_str(r,b,sizeof(b));
-    int on=0;if(httpd_query_key_value(b,"on",v,sizeof(v))==ESP_OK)on=atoi(v);
-    esp_err_t ret=dl_write1_retry(get_id(r),ADDR_LED,on?1:0);
-    httpd_resp_set_type(r,"text/plain"); httpd_resp_send(r,ret==ESP_OK?(on?"ON":"OFF"):"FAIL",ret==ESP_OK?2:4);
-    return ESP_OK;
-}
-
-// 瞬返 /read (数据由后台 poll_task 持续更新)
-static esp_err_t h_read(httpd_req_t *r) {
-    int32_t p=g_pos, v=g_vel; int16_t c=g_cur;
-    char j[160];snprintf(j,sizeof(j),"{\"pos\":%ld,\"vel\":%ld,\"cur\":%d,\"goal\":%ld}",
-                         (long)p,(long)v,(int)(c*269/100),(long)g_goal);
-    httpd_resp_set_type(r,"application/json");httpd_resp_send(r,j,strlen(j));
-    return ESP_OK;
-}
-
-// =====================================================
-// HTML 页面
-// =====================================================
-
-static const char *HTML =
+static const char *HTML=
 "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
 "<title>XL330</title><style>"
 "*{margin:0;padding:0;box-sizing:border-box}"
-"body{background:#1a1a2e;color:#cdd;font:14px/1.5 'Segoe UI',Arial,sans-serif;padding:12px;max-width:420px;margin:auto}"
-".hdr{display:flex;align-items:center;gap:10px;margin-bottom:10px}"
+"body{background:#111827;color:#e5e7eb;font:14px/1.5 'Segoe UI',Arial,sans-serif;padding:12px;max-width:420px;margin:auto}"
+".hdr{display:flex;align-items:center;gap:8px;margin-bottom:8px}"
 ".hdr h1{font-size:18px;color:#a78bfa;flex:1}"
-".hdr button{padding:6px 12px;border:none;border-radius:4px;font-size:11px;font-weight:bold;cursor:pointer;color:#fff;background:#3b82f6}"
-".hdr button:active{opacity:.8}"
-".card{background:#16213e;border-radius:8px;padding:12px;margin-bottom:8px}"
-".card h3{font-size:13px;color:#7c3aed;margin-bottom:8px;border-bottom:1px solid #2a2a3e;padding-bottom:5px}"
-".row{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:6px}"
+".hdr span{font-size:11px;color:#666}.hdr button{padding:5px 10px;border:none;border-radius:4px;font-size:11px;font-weight:bold;cursor:pointer;color:#fff;background:#3b82f6}"
+".card{background:#1f2937;border-radius:8px;padding:12px;margin-bottom:8px}"
+".card h3{font-size:12px;color:#7c3aed;margin-bottom:6px;border-bottom:1px solid #374151;padding-bottom:4px}"
+".row{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:4px}"
 "button{color:#fff;border:none;border-radius:4px;padding:8px 12px;font-size:13px;font-weight:bold;cursor:pointer}"
 "button:active{opacity:.8}"
-"#cur-pos{font-size:36px;font-weight:bold;color:#a78bfa;text-align:center;padding:8px 0}"
-"#cur-deg{font-size:16px;color:#888;text-align:center}"
-".big{font-size:16px;padding:10px 20px}"
-".b-go{background:#7c3aed;flex:1}.b-go2{background:#7c3aed;width:100%}"
-".b-step{background:#2a2a3e;min-width:40px;font-size:18px}"
-".b-num{background:#3b82f6}"
-".b-red{background:#ef4444}.b-grn{background:#10b981}.b-yel{background:#f59e0b}"
+"#pos{font-size:38px;font-weight:bold;color:#a78bfa;text-align:center;padding:6px 0}"
+"#deg{font-size:16px;color:#888;text-align:center}"
+".b-go{background:#7c3aed;width:100%}.b-num{background:#3b82f6}.b-step{background:#374151;min-width:40px;font-size:16px}"
+".b-yel{background:#f59e0b}"
 ".tgl{width:40px;height:22px;background:#374151;border-radius:11px;position:relative;cursor:pointer;display:inline-block;vertical-align:middle;transition:.2s}"
 ".tgl.on{background:#10b981}"
 ".tgl::after{content:'';width:18px;height:18px;background:#fff;border-radius:50%;position:absolute;top:2px;left:2px;transition:.2s}"
 ".tgl.on::after{left:20px}"
-"select,input[type=number]{background:#2a2a3e;color:#fff;border:1px solid #444;padding:6px 8px;border-radius:4px;font-size:13px}"
-"input[type=number]{width:70px;text-align:center}"
-".d-row{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #1e2d4a;font-size:13px}"
-".d-row .l{color:#888}.d-row .v{color:#a78bfa;font-weight:bold}"
-".ft{margin-top:10px;color:#666;font-size:11px;text-align:center}"
+"input[type=number]{background:#374151;color:#fff;border:1px solid #444;padding:6px;border-radius:4px;font-size:13px;width:70px;text-align:center}"
+"label{font-size:12px;color:#9ca3af}"
+".dr{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #1e293b;font-size:13px}"
+".dr .l{color:#9ca3af}.dr .v{color:#a78bfa;font-weight:bold}"
+".ft{margin-top:8px;font-size:11px;color:#555;text-align:center}"
 "</style></head><body>"
-//顶栏
-"<div class='hdr'><h1>XL330 舵机控制</h1>"
-"<button onclick='api(\"/scan\")'>扫描</button></div>"
-//当前位置
-"<div class='card'><h3>当前位置</h3>"
-"<div id='cur-pos'>--</div><div id='cur-deg'>等待数据...</div></div>"
-//目标控制
-"<div class='card'><h3>目标角度</h3>"
-"<div class='row'>"
-"<button class='b-step' onclick='adj(-10)'>-10°</button>"
-"<button class='b-step' onclick='adj(-1)'>-1°</button>"
-"<input type='number' id='goal' value='180' min='0' max='360' style='font-size:22px;width:80px;flex:1'>"
-"<button class='b-step' onclick='adj(1)'>+1°</button>"
-"<button class='b-step' onclick='adj(10)'>+10°</button></div>"
-"<div class='row' style='margin-top:6px'>"
-"<button class='b-num' onclick='setGoal(0)'>0°</button>"
-"<button class='b-num' onclick='setGoal(90)'>90°</button>"
-"<button class='b-num' onclick='setGoal(180)'>180°</button>"
-"<button class='b-num' onclick='setGoal(270)'>270°</button></div>"
-"<button class='b-go2' onclick='setGoal(parseInt(document.getElementById(\"goal\").value))'>转到目标角度</button></div>"
-//扭矩+模式+LED
+"<div class='hdr'><h1>XL330 舵机</h1><span id='wifi-st'>--</span><button onclick='api(\"/scan\")'>扫描</button></div>"
+"<div class='card'><h3>当前位置</h3><div id='pos'>--</div><div id='deg'>等待...</div></div>"
+"<div class='card'><h3>目标角度</h3><div class='row'>"
+"<button class='b-step' onclick='adj(-10)'>-10°</button><button class='b-step' onclick='adj(-1)'>-1°</button>"
+"<input type='number' id='goal' value='180' min='0' max='360'>"
+"<button class='b-step' onclick='adj(1)'>+1°</button><button class='b-step' onclick='adj(10)'>+10°</button></div>"
+"<div class='row' style='margin-top:4px'><button class='b-num' onclick='setG(0)'>0°</button><button class='b-num' onclick='setG(90)'>90°</button>"
+"<button class='b-num' onclick='setG(180)'>180°</button><button class='b-num' onclick='setG(270)'>270°</button></div>"
+"<button class='b-go' onclick='setG(parseInt(document.getElementById(\"goal\").value))'>转到目标角度</button></div>"
 "<div class='card'><h3>开关</h3><div class='row'>"
-"<label>扭矩</label><span class='tgl' id='t-torque' onclick='toggleT(this)'></span>"
-"<label style='margin-left:10px'>模式</label><select id='mode' onchange='api(\"/mode?v=\"+this.value)'>"
-"<option value='3'>位置</option><option value='4'>扩展位置</option><option value='1'>速度</option><option value='0'>电流</option></select>"
-"<button class='b-yel' style='margin-left:auto' onclick='api(\"/sled?on=\"+(this.textContent==\"LED开\"?0:1));this.textContent=this.textContent==\"LED开\"?\"LED关\":\"LED开\"'>LED关</button>"
+"<label>扭矩</label><span class='tgl' onclick='toggleT(this)'></span>"
+"<label style='margin-left:8px'>模式</label><select id='mode' onchange='api(\"/mode?v=\"+this.value)'><option value='3'>位置</option><option value='4'>扩展位置</option><option value='1'>速度</option></select>"
+"<button class='b-yel' style='margin-left:auto' onclick='var b=this;api(\"/sled?on=\"+(b.textContent==\"LED开\"?0:1));b.textContent=b.textContent==\"LED开\"?\"LED关\":\"LED开\"'>LED关</button>"
 "</div></div>"
-//实时数据
 "<div class='card'><h3>实时数据</h3>"
-"<div class='d-row'><span class='l'>位置</span><span class='v' id='v-pos'>--</span></div>"
-"<div class='d-row'><span class='l'>速度</span><span class='v' id='v-vel'>--</span></div>"
-"<div class='d-row'><span class='l'>电流</span><span class='v' id='v-cur'>--</span></div></div>"
-"<div class='ft'>WiFi: " WIFI_SSID " | ID:1 | 57600</div>"
+"<div class='dr'><span class='l'>位置</span><span class='v' id='v-pos'>--</span></div>"
+"<div class='dr'><span class='l'>速度</span><span class='v' id='v-vel'>--</span></div>"
+"<div class='dr'><span class='l'>电流</span><span class='v' id='v-cur'>--</span></div></div>"
+"<div class='ft' id='status'>就绪</div>"
 "<script>"
-"var CID=1,curDeg=0;"
-"function api(u){"
-"u+=(u.includes('?')?'&':'?')+'id='+CID;"
-"fetch(u).then(r=>r.text()).then(t=>{document.querySelector('.ft').textContent=t.substring(0,40);}).catch(()=>{});}"
+"var CID=1;"
+"function api(u){u+=(u.includes('?')?'&':'?')+'id='+CID;return fetch(u).then(r=>r.text());}"
 "function toggleT(el){var on=el.classList.contains('on');el.classList.toggle('on');api('/torque?on='+(on?0:1));}"
-"function setGoal(deg){deg=Math.max(0,Math.min(360,deg));document.getElementById('goal').value=deg;api('/pos?deg='+deg);}"
-"function adj(d){setGoal(parseInt(document.getElementById('goal').value)+d);}"
-"function update(){fetch('/read?id='+CID).then(r=>r.json()).then(j=>{"
-"if(j.pos>=0){curDeg=j.pos/4096*360;"
-"document.getElementById('cur-pos').textContent=j.pos;"
-"document.getElementById('cur-deg').textContent=curDeg.toFixed(1)+'° / '+(360-curDeg).toFixed(1)+'°';"
-"document.getElementById('v-pos').textContent=j.pos+' ('+curDeg.toFixed(1)+'°)';"
-"document.getElementById('v-vel').textContent=j.vel;"
-"document.getElementById('v-cur').textContent=j.cur+' mA';"
-"}}).catch(()=>{});}"
-"setInterval(update,300);update();"
+"function setG(d){d=Math.max(0,Math.min(360,d));document.getElementById('goal').value=d;api('/pos?deg='+d).then(t=>{document.getElementById('status').textContent=t;})}"
+"function adj(d){setG(parseInt(document.getElementById('goal').value)+d);}"
+"function up(){fetch('/read?id='+CID).then(r=>r.json()).then(j=>{if(j.pos>=0){var d=j.pos/4096*360;"
+"document.getElementById('pos').textContent=j.pos;document.getElementById('deg').textContent=d.toFixed(1)+'° / '+(360-d).toFixed(1)+'°';"
+"document.getElementById('v-pos').textContent=j.pos+' ('+d.toFixed(1)+'°)';"
+"document.getElementById('v-vel').textContent=j.vel;document.getElementById('v-cur').textContent=j.cur+' mA';"
+"document.getElementById('wifi-st').textContent='在线';}}).catch(()=>{document.getElementById('wifi-st').textContent='离线';});}"
+"setInterval(up,300);up();"
 "</script></body></html>";
 
-static esp_err_t h_root(httpd_req_t *r) {
-    httpd_resp_set_type(r,"text/html; charset=utf-8");
-    httpd_resp_send(r,HTML,strlen(HTML));
-    return ESP_OK;
+// =====================================================
+// HTTP 端点
+// =====================================================
+
+static void cors(httpd_req_t*r){
+    httpd_resp_set_hdr(r,"Access-Control-Allow-Origin","*");
+}
+
+static esp_err_t h_root(httpd_req_t*r){cors(r);httpd_resp_set_type(r,"text/html; charset=utf-8");httpd_resp_send(r,HTML,strlen(HTML));return ESP_OK;}
+
+static esp_err_t h_info(httpd_req_t*r){
+    cors(r);char j[200];
+    snprintf(j,sizeof(j),"{\"name\":\"XL330-%d\",\"ip\":\"%s\",\"pos\":%ld,\"vel\":%ld,\"cur\":%d}",
+             DXL_ID,g_ip_str,(long)g_pos,(long)g_vel,(int)(g_cur*269/100));
+    httpd_resp_set_type(r,"application/json");httpd_resp_send(r,j,strlen(j));return ESP_OK;
+}
+
+static esp_err_t h_ping(httpd_req_t*r){cors(r);httpd_resp_set_type(r,"text/plain");httpd_resp_send(r,"OK",2);return ESP_OK;}
+
+static esp_err_t h_scan(httpd_req_t*r){
+    cors(r);char m[256]="";for(int id=0;id<=6;id++)if(dl_ping(id)){char t[32];snprintf(t,sizeof(t),"ID%d ",id);strcat(m,t);}
+    if(strlen(m)==0)strcpy(m,"未找到舵机");
+    httpd_resp_set_type(r,"text/plain");httpd_resp_send(r,m,strlen(m));return ESP_OK;
+}
+
+static esp_err_t h_torque(httpd_req_t*r){
+    cors(r);char b[32],v[8];httpd_req_get_url_query_str(r,b,sizeof(b));
+    int on=0;if(httpd_query_key_value(b,"on",v,sizeof(v))==ESP_OK)on=atoi(v);
+    dl_write1(DXL_ID,ADDR_TORQUE_ENABLE,on?1:0);
+    httpd_resp_set_type(r,"text/plain");httpd_resp_send(r,on?"ON":"OFF",2);return ESP_OK;
+}
+
+static esp_err_t h_mode(httpd_req_t*r){
+    cors(r);char b[32],v[8];httpd_req_get_url_query_str(r,b,sizeof(b));
+    int m=3;if(httpd_query_key_value(b,"v",v,sizeof(v))==ESP_OK)m=atoi(v);
+    dl_write1(DXL_ID,ADDR_TORQUE_ENABLE,0);dl_write1(DXL_ID,ADDR_OPERATING_MODE,m);dl_write1(DXL_ID,ADDR_TORQUE_ENABLE,1);
+    httpd_resp_set_type(r,"text/plain");httpd_resp_send(r,"OK",2);return ESP_OK;
+}
+
+static esp_err_t h_pos(httpd_req_t*r){
+    cors(r);char b[32],v[8];httpd_req_get_url_query_str(r,b,sizeof(b));
+    int deg=0;if(httpd_query_key_value(b,"deg",v,sizeof(v))==ESP_OK)deg=atoi(v);
+    if(deg<0||deg>360){httpd_resp_send_err(r,HTTPD_400_BAD_REQUEST,"0-360");return ESP_FAIL;}
+    g_goal=deg;dl_write4(DXL_ID,ADDR_GOAL_POSITION,(uint32_t)(deg/360.0*4096));
+    char m[32];snprintf(m,sizeof(m),"%d°",deg);
+    httpd_resp_set_type(r,"text/plain");httpd_resp_send(r,m,strlen(m));return ESP_OK;
+}
+
+static esp_err_t h_led(httpd_req_t*r){
+    cors(r);char b[32],v[8];httpd_req_get_url_query_str(r,b,sizeof(b));
+    int on=0;if(httpd_query_key_value(b,"on",v,sizeof(v))==ESP_OK)on=atoi(v);
+    dl_write1(DXL_ID,ADDR_LED,on?1:0);
+    httpd_resp_set_type(r,"text/plain");httpd_resp_send(r,on?"ON":"OFF",2);return ESP_OK;
+}
+
+static esp_err_t h_read(httpd_req_t*r){
+    cors(r);int32_t p=g_pos,v=g_vel;int16_t c=g_cur;
+    char j[160];snprintf(j,sizeof(j),"{\"pos\":%ld,\"vel\":%ld,\"cur\":%d,\"goal\":%ld}",(long)p,(long)v,(int)(c*269/100),(long)g_goal);
+    httpd_resp_set_type(r,"application/json");httpd_resp_send(r,j,strlen(j));return ESP_OK;
 }
 
 // =====================================================
-// 初始化
+// HTTP 初始化
 // =====================================================
 
-static void wifi_init(void) {
-    nvs_flash_init();esp_netif_init();esp_event_loop_create_default();esp_netif_create_default_wifi_ap();
-    wifi_init_config_t wc=WIFI_INIT_CONFIG_DEFAULT();esp_wifi_init(&wc);
-    wifi_config_t ap={.ap={.ssid=WIFI_SSID,.ssid_len=strlen(WIFI_SSID),.password=WIFI_PASS,
-                     .channel=1,.authmode=WIFI_AUTH_WPA2_PSK,.max_connection=4}};
-    esp_wifi_set_mode(WIFI_MODE_AP);esp_wifi_set_config(WIFI_IF_AP,&ap);esp_wifi_start();
-    ESP_LOGI(TAG,"WiFi: %s -> http://192.168.4.1",WIFI_SSID);
-}
-
-static void http_init(void) {
-    httpd_handle_t s=NULL;httpd_config_t c=HTTPD_DEFAULT_CONFIG();httpd_start(&s,&c);
+static void http_init(void){
+    httpd_handle_t s=NULL;httpd_config_t c=HTTPD_DEFAULT_CONFIG();
+    c.lru_purge_enable=true;c.max_uri_handlers=16;httpd_start(&s,&c);
     httpd_uri_t u[]={
-        {.uri="/",.method=HTTP_GET,.handler=h_root},{.uri="/ping",.method=HTTP_GET,.handler=h_ping},
-        {.uri="/scan",.method=HTTP_GET,.handler=h_scan},{.uri="/torque",.method=HTTP_GET,.handler=h_torque},
-        {.uri="/mode",.method=HTTP_GET,.handler=h_mode},{.uri="/pos",.method=HTTP_GET,.handler=h_pos},
-        {.uri="/sled",.method=HTTP_GET,.handler=h_led},{.uri="/read",.method=HTTP_GET,.handler=h_read},
+        {.uri="/",.method=HTTP_GET,.handler=h_root},{.uri="/info",.method=HTTP_GET,.handler=h_info},
+        {.uri="/ping",.method=HTTP_GET,.handler=h_ping},{.uri="/scan",.method=HTTP_GET,.handler=h_scan},
+        {.uri="/torque",.method=HTTP_GET,.handler=h_torque},{.uri="/mode",.method=HTTP_GET,.handler=h_mode},
+        {.uri="/pos",.method=HTTP_GET,.handler=h_pos},{.uri="/sled",.method=HTTP_GET,.handler=h_led},
+        {.uri="/read",.method=HTTP_GET,.handler=h_read},
     };
     for(int i=0;i<sizeof(u)/sizeof(u[0]);i++)httpd_register_uri_handler(s,&u[i]);
+    ESP_LOGI(TAG,"HTTP server started");
+}
+
+// =====================================================
+// WiFi STA
+// =====================================================
+
+static void wifi_event_handler(void*arg,esp_event_base_t eb,int32_t id,void*data){
+    if(eb==WIFI_EVENT&&id==WIFI_EVENT_STA_START){esp_wifi_connect();}
+    else if(eb==WIFI_EVENT&&id==WIFI_EVENT_STA_DISCONNECTED){
+        ESP_LOGW(TAG,"WiFi断开,重连中...");snprintf(g_ip_str,sizeof(g_ip_str),"0.0.0.0");
+        xEventGroupClearBits(wifi_event_group,WIFI_CONNECTED_BIT);
+        ws2812_rgb(30,0,0);vTaskDelay(pdMS_TO_TICKS(1000));esp_wifi_connect();
+    }else if(eb==IP_EVENT&&id==IP_EVENT_STA_GOT_IP){
+        ip_event_got_ip_t*ev=(ip_event_got_ip_t*)data;
+        snprintf(g_ip_str,sizeof(g_ip_str),IPSTR,IP2STR(&ev->ip_info.ip));
+        ESP_LOGI(TAG,"Got IP: %s",g_ip_str);
+        xEventGroupSetBits(wifi_event_group,WIFI_CONNECTED_BIT);
+        ws2812_rgb(0,30,0);
+    }
+}
+
+static void wifi_init(void){
+    esp_err_t r=nvs_flash_init();
+    if(r==ESP_ERR_NVS_NO_FREE_PAGES||r==ESP_ERR_NVS_NEW_VERSION_FOUND){nvs_flash_erase();nvs_flash_init();}
+    esp_netif_init();esp_event_loop_create_default();
+    wifi_event_group=xEventGroupCreate();esp_netif_create_default_wifi_sta();
+    wifi_init_config_t wc=WIFI_INIT_CONFIG_DEFAULT();esp_wifi_init(&wc);
+    esp_event_handler_instance_register(WIFI_EVENT,ESP_EVENT_ANY_ID,wifi_event_handler,NULL,NULL);
+    esp_event_handler_instance_register(IP_EVENT,IP_EVENT_STA_GOT_IP,wifi_event_handler,NULL,NULL);
+    wifi_config_t sc={.sta={.ssid=WIFI_SSID,.password=WIFI_PASS,.threshold.authmode=WIFI_AUTH_OPEN}};
+    esp_wifi_set_mode(WIFI_MODE_STA);esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_config(WIFI_IF_STA,&sc);esp_wifi_start();
+    ESP_LOGI(TAG,"连接WiFi: %s",WIFI_SSID);
+    xEventGroupWaitBits(wifi_event_group,WIFI_CONNECTED_BIT,pdFALSE,pdTRUE,pdMS_TO_TICKS(20000));
 }
 
 // =====================================================
 // 主程序
 // =====================================================
 
-void app_main(void) {
-    uart_mutex = xSemaphoreCreateMutex();
-    ws2812_init();
-    for(int i=0;i<3;i++){ws2812_set(1);vTaskDelay(pdMS_TO_TICKS(80));ws2812_set(0);vTaskDelay(pdMS_TO_TICKS(80));}
+void app_main(void){
+    ESP_LOGI(TAG,"App start");
+    uart_mutex=xSemaphoreCreateMutex();
+    ws2812_init();ws2812_rgb(0,0,30);
+
     dxl_uart_init();
-    ESP_LOGI(TAG,"UART ready. TX=GPIO%d RX=GPIO%d",DXL_TX_GPIO,DXL_RX_GPIO);
+    ESP_LOGI(TAG,"UART: TX=GPIO%d RX=GPIO%d",DXL_TX_GPIO,DXL_RX_GPIO);
 
     // 初始化舵机
     dl_write1(DXL_ID,ADDR_TORQUE_ENABLE,0);
     dl_write1(DXL_ID,ADDR_OPERATING_MODE,MODE_POSITION);
     dl_write1(DXL_ID,ADDR_TORQUE_ENABLE,1);
-    ESP_LOGI(TAG,"Servo ID%d initialized",DXL_ID);
+    ESP_LOGI(TAG,"舵机 ID%d 初始化完成",DXL_ID);
 
     xTaskCreate(poll_task,"poll",4096,NULL,5,NULL);
     xTaskCreate(recover_task,"recov",3072,NULL,1,NULL);
 
     wifi_init();http_init();
-    ws2812_set(1);
-    ESP_LOGI(TAG,"WiFi: %s 密码: %s",WIFI_SSID,WIFI_PASS);
-    ESP_LOGI(TAG,"浏览器打开 http://192.168.4.1");
+
+    ESP_LOGI(TAG,"就绪! http://%s/",g_ip_str);
 }

@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>XL330 多设备控制</title><style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0f0f1a;color:#cdd;font:14px/1.5 'Segoe UI',Arial,sans-serif;padding:12px;max-width:440px;margin:auto}
+h1{font-size:18px;color:#a78bfa;margin-bottom:6px}
+.sub{font-size:11px;color:#666;margin-bottom:12px}
+.dev-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
+.dev-btn{padding:6px 12px;border:none;border-radius:4px;font-size:12px;cursor:pointer;color:#fff;background:#2a2a3e;transition:.15s}
+.dev-btn.sel{background:#7c3aed}
+.dev-btn:hover{background:#3b3b5e}
+.card{background:#16213e;border-radius:8px;padding:12px;margin-bottom:8px}
+.card h3{font-size:13px;color:#7c3aed;margin-bottom:8px;border-bottom:1px solid #2a2a3e;padding-bottom:5px}
+.row{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:4px}
+button{color:#fff;border:none;border-radius:4px;padding:8px 12px;font-size:13px;font-weight:bold;cursor:pointer}
+button:active{opacity:.8}
+#cur-pos{font-size:36px;font-weight:bold;color:#a78bfa;text-align:center}
+#cur-deg{font-size:16px;color:#888;text-align:center}
+.b-go{background:#7c3aed;width:100%}.b-blu{background:#3b82f6}
+.b-step{background:#2a2a3e;min-width:40px;font-size:16px}
+.b-yel{background:#f59e0b}
+.tgl{width:40px;height:22px;background:#374151;border-radius:11px;position:relative;cursor:pointer;display:inline-block;vertical-align:middle;transition:.2s}
+.tgl.on{background:#10b981}
+.tgl::after{content:'';width:18px;height:18px;background:#fff;border-radius:50%;position:absolute;top:2px;left:2px;transition:.2s}
+.tgl.on::after{left:20px}
+input[type=number]{background:#2a2a3e;color:#fff;border:1px solid #444;padding:6px 8px;border-radius:4px;font-size:13px;width:70px;text-align:center}
+label{font-size:12px;color:#aaa}
+.d-row{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #1e2d4a;font-size:13px}
+.d-row .l{color:#888}.d-row .v{color:#a78bfa;font-weight:bold}
+.ft{margin-top:10px;color:#555;font-size:11px;text-align:center}
+pre{font-size:10px;color:#444;background:#0a0a14;padding:8px;border-radius:4px;overflow-x:auto;margin-top:8px}
+</style></head><body>
+<h1>XL330 多设备控制</h1>
+<div class='sub'>手机开热点，ESP32和电脑都连同一个热点</div>
+<div class='row' style='margin-bottom:8px'>
+<input id='newip' placeholder='输入设备IP' style='flex:1;width:auto'>
+<button class='b-blu' onclick='addDev(document.getElementById("newip").value)'>添加</button></div>
+<div class='dev-row' id='devs'></div>
+<div class='card'><h3>当前位置 - <span id='sel-name'>未选择</span></h3>
+<div id='cur-pos'>--</div><div id='cur-deg'>选择设备后自动连接</div></div>
+<div class='card'><h3>目标角度</h3>
+<div class='row'>
+<button class='b-step' onclick='adj(-10)'>-10°</button>
+<button class='b-step' onclick='adj(-1)'>-1°</button>
+<input type='number' id='goal' value='180' min='0' max='360'>
+<button class='b-step' onclick='adj(1)'>+1°</button>
+<button class='b-step' onclick='adj(10)'>+10°</button></div>
+<div class='row' style='margin-top:4px'>
+<button class='b-blu' onclick='setGoal(0)'>0°</button>
+<button class='b-blu' onclick='setGoal(90)'>90°</button>
+<button class='b-blu' onclick='setGoal(180)'>180°</button>
+<button class='b-blu' onclick='setGoal(270)'>270°</button></div>
+<button class='b-go' onclick='setGoal(parseInt(document.getElementById("goal").value))'>转到目标角度</button></div>
+<div class='card'><h3>开关</h3><div class='row'>
+<label>扭矩</label><span class='tgl' id='t-torque' onclick='toggleT(this)'></span>
+<label style='margin-left:10px'>模式</label><select id='mode' onchange='api("/mode?v="+this.value)'><option value='3'>位置</option><option value='4'>扩展位置</option><option value='1'>速度</option><option value='0'>电流</option></select>
+<button class='b-yel' style='margin-left:auto' onclick='var b=this;api("/sled?on="+(b.textContent=="LED开"?0:1));b.textContent=b.textContent=="LED开"?"LED关":"LED开"'>LED关</button>
+</div></div>
+<div class='card'><h3>实时数据</h3>
+<div class='d-row'><span class='l'>位置</span><span class='v' id='v-pos'>--</span></div>
+<div class='d-row'><span class='l'>速度</span><span class='v' id='v-vel'>--</span></div>
+<div class='d-row'><span class='l'>电流</span><span class='v' id='v-cur'>--</span></div></div>
+<div class='ft'><span id='status'>选择设备开始</span></div>
+<pre id='log' style='max-height:80px;overflow-y:auto'></pre>
+<script>
+var base='',name='',devs=JSON.parse(localStorage.getItem('xldevs')||'[]');
+var defaults=['192.168.43.100','192.168.43.101','192.168.43.102'];
+if(devs.length==0) devs=defaults;
+function renderDevs(){
+ var h=''; devs.forEach(function(d,i){
+  h+='<button class="dev-btn'+(d==base?' sel':'')+'" onclick="selDev(\''+d+'\')">'+d+'</button>';
+ });
+ document.getElementById('devs').innerHTML=h||'<span style="color:#888;font-size:12px">无设备, 输入IP添加</span>';
+}
+function addDev(ip){
+ if(!ip||devs.includes(ip))return; devs.push(ip);save();selDev(ip);
+}
+function save(){localStorage.setItem('xldevs',JSON.stringify(devs));}
+function selDev(ip){
+ base=ip; save(); renderDevs();
+ fetch(base+'/info').then(r=>r.json()).then(j=>{
+  name=j.name; document.getElementById('sel-name').textContent=name;
+  log('已连接 '+name+' ('+ip+')');
+ }).catch(e=>{log('连接失败: '+ip);});
+}
+function api(u){
+ var url=base+u;document.getElementById('status').textContent='请求中...';
+ fetch(url).then(r=>r.text()).then(t=>{
+  document.getElementById('status').textContent=t.substring(0,30);
+  log(t.substring(0,60));
+ }).catch(e=>{document.getElementById('status').textContent='失败';});
+}
+function toggleT(el){var on=el.classList.contains('on');el.classList.toggle('on');api('/torque?on='+(on?0:1));}
+function setGoal(d){d=Math.max(0,Math.min(360,d));document.getElementById('goal').value=d;api('/pos?deg='+d);}
+function adj(d){setGoal(parseInt(document.getElementById('goal').value)+d);}
+function log(m){var e=document.getElementById('log');e.textContent=new Date().toLocaleTimeString()+' '+m+'\n'+e.textContent.split('\n').slice(0,9).join('\n');}
+function update(){
+ if(!base)return;
+ fetch(base+'/read').then(r=>r.json()).then(j=>{
+  if(j.pos>=0){
+   var d=j.pos/4096*360;
+   document.getElementById('cur-pos').textContent=j.pos;
+   document.getElementById('cur-deg').textContent=d.toFixed(1)+'° / '+(360-d).toFixed(1)+'°';
+   document.getElementById('v-pos').textContent=j.pos+' ('+d.toFixed(1)+'°)';
+   document.getElementById('v-vel').textContent=j.vel;
+   document.getElementById('v-cur').textContent=j.cur+' mA';
+  }
+ }).catch(()=>{});
+}
+renderDevs(); if(devs.length)selDev(devs[0]);
+setInterval(update,300);
+</script></body></html>
